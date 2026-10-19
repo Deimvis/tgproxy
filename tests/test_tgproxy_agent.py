@@ -183,7 +183,7 @@ class TgproxyAgentTests(unittest.TestCase):
         _, stderr = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 1)
         self.assertIn("did not start listening", stderr)
-        self.assertEqual(self.read_state()["sleeps"], 40)
+        self.assertEqual(self.read_state()["sleeps"], 60)
         self.assertEqual(self.calls_of("gost"), [])
         self.assertTrue(self.read_state().get("ssh_terminated"))
 

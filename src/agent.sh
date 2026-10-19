@@ -5,7 +5,7 @@ gost_upstream_url='@gost_upstream_url@'
 tunnel_ssh_host='@tunnel_ssh_host@'
 tunnel_target_address='@tunnel_target_address@'
 tunnel_local_port='@tunnel_local_port@'
-tunnel_readiness_attempt_limit=40
+tunnel_readiness_attempt_limit=60
 
 tunnel_process_id=''
 gost_process_id=''
@@ -38,7 +38,7 @@ wait_for_tunnel() {
         if tunnel_is_listening; then
             return 0
         fi
-        @sleep@ 0.25
+        @sleep@ 1
     done
     echo 'tgproxy agent: ssh tunnel did not start listening' >&2
     return 1
