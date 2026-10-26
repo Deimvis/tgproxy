@@ -9,7 +9,7 @@ A local socks5 endpoint for Telegram on macOS. Telegram connects to `socks5://12
 * `tgproxy status`: report whether the endpoint is listening (exit code 0 when it is).
 * `tgproxy logs`: show the last 50 lines of `~/Library/Logs/tgproxy.log`.
 
-The agent is loaded manually, it does not start at login. launchd restarts it when gost or the ssh tunnel exits.
+The agent is loaded manually, it does not start at login. launchd restarts it when gost or the ssh tunnel exits. When the ssh tunnel fails to come up, the agent retries it with exponential backoff (5s doubling up to 5m), so an unreachable or rate-limiting ssh server is not hammered with connections.
 
 ## Nix
 

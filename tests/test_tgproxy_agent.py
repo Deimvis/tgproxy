@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,7 @@ def run_until_terminated():
 
 state = record_call()
 if command == "ssh":
-    if state.get("ssh_failure"):
+    if len([call for call in state["calls"] if call[0] == "ssh"]) <= state.get("ssh_failure_count", 0):
         sys.exit(255)
     update_state(ssh_pid=os.getpid())
     run_until_terminated()
@@ -109,13 +110,27 @@ class TgproxyAgentTests(unittest.TestCase):
         return json.loads(self.state_path.read_text())
 
     def start_agent(self):
-        return subprocess.Popen(
+        process = subprocess.Popen(
             [shutil.which("bash"), str(self.script_path)],
             env=dict(os.environ, TGPROXY_TEST_STATE_PATH=str(self.state_path)),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
+        self.addCleanup(self.kill_process_group, process)
+        return process
+
+    def kill_process_group(self, process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.communicate(timeout=5)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
     def wait_for_calls(self, command, timeout_s=5):
         deadline = time.monotonic() + timeout_s
@@ -131,7 +146,6 @@ class TgproxyAgentTests(unittest.TestCase):
     def test_gost_starts_after_tunnel_listens(self):
         self.write_state(tunnel_listening=False, readiness_delay=2)
         process = self.start_agent()
-        self.addCleanup(process.kill)
         self.wait_for_calls("gost")
         self.assertEqual(self.read_state()["sleeps"], 2)
         self.assertEqual(
@@ -144,11 +158,11 @@ class TgproxyAgentTests(unittest.TestCase):
         self.assertEqual(ssh_arguments[-1], "jump")
         self.assertIn("BatchMode=yes", ssh_arguments)
         self.assertIn("ExitOnForwardFailure=yes", ssh_arguments)
+        self.assertIn("ConnectTimeout=15", ssh_arguments)
         self.assertIsNone(process.poll())
 
     def test_agent_stops_children_and_exits_when_terminated(self):
         process = self.start_agent()
-        self.addCleanup(process.kill)
         self.wait_for_calls("gost")
         process.terminate()
         process.wait(timeout=5)
@@ -161,37 +175,56 @@ class TgproxyAgentTests(unittest.TestCase):
     def test_gost_exit_stops_tunnel_and_fails(self):
         self.write_state(gost_failure=True)
         process = self.start_agent()
-        self.addCleanup(process.kill)
         _, stderr = process.communicate(timeout=8)
         self.assertEqual(process.returncode, 1)
         self.assertIn("child process exited", stderr)
         self.assertTrue(self.read_state().get("ssh_terminated"))
 
-    def test_tunnel_exit_before_listening_fails_without_gost(self):
-        self.write_state(ssh_failure=True, tunnel_listening=False)
-        process = self.start_agent()
-        self.addCleanup(process.kill)
-        _, stderr = process.communicate(timeout=8)
-        self.assertEqual(process.returncode, 1)
-        self.assertIn("exited before listening", stderr)
-        self.assertEqual(self.calls_of("gost"), [])
+    def wait_for_call_count(self, command, count, timeout_s=30):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if len(self.calls_of(command)) >= count:
+                return
+            time.sleep(0.05)
+        self.fail(f"{command} was not called {count} times")
 
-    def test_tunnel_readiness_timeout_is_bounded(self):
+    def retry_delays(self):
+        return [call[1] for call in self.calls_of("sleep") if call[1] != "1"]
+
+    def test_tunnel_exit_before_listening_is_retried_with_backoff(self):
+        self.write_state(ssh_failure_count=3)
+        process = self.start_agent()
+        self.wait_for_calls("gost")
+        self.assertEqual(len(self.calls_of("ssh")), 4)
+        self.assertEqual(self.retry_delays(), ["5", "10", "20"])
+        self.assertIsNone(process.poll())
+        process.terminate()
+        _, stderr = process.communicate(timeout=5)
+        self.assertIn("ssh tunnel exited before listening", stderr)
+        self.assertRegex(stderr, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} tgproxy agent: retrying ssh tunnel in 5s")
+
+    def test_tunnel_retry_delay_is_capped(self):
+        self.write_state(ssh_failure_count=8)
+        process = self.start_agent()
+        self.wait_for_calls("gost")
+        self.assertEqual(self.retry_delays(), ["5", "10", "20", "40", "80", "160", "300", "300"])
+
+    def test_tunnel_readiness_timeout_stops_tunnel_and_retries(self):
         self.write_state(tunnel_listening=False)
         process = self.start_agent()
-        self.addCleanup(process.kill)
-        _, stderr = process.communicate(timeout=30)
-        self.assertEqual(process.returncode, 1)
-        self.assertIn("did not start listening", stderr)
-        self.assertEqual(self.read_state()["sleeps"], 60)
-        self.assertEqual(self.calls_of("gost"), [])
+        self.wait_for_call_count("ssh", 2)
         self.assertTrue(self.read_state().get("ssh_terminated"))
+        self.assertEqual(self.read_state()["sleeps"], 61)
+        self.assertEqual(self.retry_delays(), ["5"])
+        self.assertEqual(self.calls_of("gost"), [])
+        process.terminate()
+        _, stderr = process.communicate(timeout=5)
+        self.assertIn("did not start listening", stderr)
 
     def test_without_tunnel_runs_gost_directly(self):
         self.tunnel_disabled = True
         self.setUp()
         process = self.start_agent()
-        self.addCleanup(process.kill)
         self.wait_for_calls("gost")
         self.assertEqual(self.calls_of("ssh"), [])
         self.assertEqual(
@@ -205,7 +238,6 @@ class TgproxyAgentTests(unittest.TestCase):
         self.setUp()
         self.write_state(gost_failure=True)
         process = self.start_agent()
-        self.addCleanup(process.kill)
         _, stderr = process.communicate(timeout=8)
         self.assertEqual(process.returncode, 1)
         self.assertIn("child process exited", stderr)
