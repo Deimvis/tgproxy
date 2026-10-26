@@ -2,12 +2,14 @@ set -euo pipefail
 
 listen_address='@listen_address@'
 gost_upstream_url='@gost_upstream_url@'
+direct_upstream_url='@direct_upstream_url@'
 tunnel_ssh_host='@tunnel_ssh_host@'
 tunnel_target_address='@tunnel_target_address@'
 tunnel_local_port='@tunnel_local_port@'
 tunnel_readiness_attempt_limit=60
 tunnel_retry_initial_delay_s=5
 tunnel_retry_max_delay_s=300
+tunnel_retry_poll_interval_s=5
 
 tunnel_process_id=''
 gost_process_id=''
@@ -30,6 +32,10 @@ stop_children() {
 
 tunnel_is_alive() {
     kill -0 "$tunnel_process_id" 2>/dev/null
+}
+
+gost_is_alive() {
+    kill -0 "$gost_process_id" 2>/dev/null
 }
 
 tunnel_is_listening() {
@@ -64,16 +70,50 @@ start_tunnel() {
         -L "127.0.0.1:$tunnel_local_port:$tunnel_target_address" \
         "$tunnel_ssh_host" &
     tunnel_process_id=$!
-    wait_for_tunnel
+    if wait_for_tunnel; then
+        return 0
+    fi
+    stop_process "$tunnel_process_id"
+    tunnel_process_id=''
+    return 1
 }
 
-start_tunnel_with_backoff() {
+start_gost() {
+    @gost@ -L "socks5://$listen_address" -F "$1" &
+    gost_process_id=$!
+}
+
+exit_if_gost_died() {
+    if ! gost_is_alive; then
+        log 'child process exited, restarting'
+        stop_children
+        exit 1
+    fi
+}
+
+sleep_while_gost_alive() {
+    local remaining_s=$1
+    while [ "$remaining_s" -gt 0 ]; do
+        exit_if_gost_died
+        @sleep@ "$tunnel_retry_poll_interval_s"
+        remaining_s=$((remaining_s - tunnel_retry_poll_interval_s))
+    done
+    exit_if_gost_died
+}
+
+run_direct_until_tunnel_returns() {
     local delay_s="$tunnel_retry_initial_delay_s"
-    until start_tunnel; do
-        stop_process "$tunnel_process_id"
-        tunnel_process_id=''
+    log "ssh tunnel unavailable; forwarding directly to the upstream proxy until the tunnel is back (traffic is not wrapped in ssh)"
+    start_gost "$direct_upstream_url"
+    while :; do
         log "retrying ssh tunnel in ${delay_s}s"
-        @sleep@ "$delay_s"
+        sleep_while_gost_alive "$delay_s"
+        if start_tunnel; then
+            log 'ssh tunnel is back; switching to the tunnelled upstream'
+            stop_process "$gost_process_id"
+            start_gost "$gost_upstream_url"
+            return 0
+        fi
         delay_s=$((delay_s * 2))
         if [ "$delay_s" -gt "$tunnel_retry_max_delay_s" ]; then
             delay_s="$tunnel_retry_max_delay_s"
@@ -91,12 +131,13 @@ wait_for_any_child() {
 
 trap stop_children EXIT
 
-if [ -n "$tunnel_ssh_host" ]; then
-    start_tunnel_with_backoff
+if [ -z "$tunnel_ssh_host" ]; then
+    start_gost "$gost_upstream_url"
+elif start_tunnel; then
+    start_gost "$gost_upstream_url"
+else
+    run_direct_until_tunnel_returns
 fi
-
-@gost@ -L "socks5://$listen_address" -F "$gost_upstream_url" &
-gost_process_id=$!
 
 wait_for_any_child
 log 'child process exited, restarting'

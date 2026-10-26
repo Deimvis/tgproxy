@@ -42,6 +42,7 @@ let
     text = substitutePlaceholders {
       listen_address = cfg.listenAddress;
       gost_upstream_url = gostUpstreamUrl;
+      direct_upstream_url = cfg.upstreamProxyUrl;
       tunnel_ssh_host = if cfg.sshTunnel.enable then cfg.sshTunnel.host else "";
       tunnel_target_address = "${upstreamProxyHost}:${upstreamProxyPort}";
       tunnel_local_port = tunnelLocalPort;

@@ -64,6 +64,7 @@ assert (agentScriptOf tunnelled).name == "tgproxy-agent";
 assert !hasPlaceholder (agentScriptOf tunnelled).text;
 assert hasInfix "gost_upstream_url='http://user:secret@127.0.0.1:15432'" (agentScriptOf tunnelled).text;
 assert hasInfix "tunnel_ssh_host='jump'" (agentScriptOf tunnelled).text;
+assert hasInfix "direct_upstream_url='http://user:secret@203.0.113.7:3128'" (agentScriptOf tunnelled).text;
 assert hasInfix "tunnel_target_address='203.0.113.7:3128'" (agentScriptOf tunnelled).text;
 assert hasInfix "tunnel_local_port='15432'" (agentScriptOf tunnelled).text;
 assert hasInfix "/test/gost/bin/gost -L" (agentScriptOf tunnelled).text;

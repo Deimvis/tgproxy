@@ -11,7 +11,9 @@ import time
 import unittest
 
 
-MOCK_EXECUTABLE = '''import json
+MOCK_EXECUTABLE = '''import contextlib
+import fcntl
+import json
 import os
 from pathlib import Path
 import signal
@@ -22,16 +24,24 @@ state_path = Path(os.environ["TGPROXY_TEST_STATE_PATH"])
 command = Path(sys.argv[0]).name
 arguments = sys.argv[1:]
 
+@contextlib.contextmanager
+def locked_state():
+    with open(state_path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(state_path.read_text())
+        yield state
+        temporary_path = state_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(state))
+        os.replace(temporary_path, state_path)
+
 def update_state(**updates):
-    state = json.loads(state_path.read_text())
-    state.update(updates)
-    state_path.write_text(json.dumps(state))
+    with locked_state() as state:
+        state.update(updates)
     return state
 
 def record_call():
-    state = json.loads(state_path.read_text())
-    state["calls"].append([command, *arguments])
-    state_path.write_text(json.dumps(state))
+    with locked_state() as state:
+        state["calls"].append([command, *arguments])
     return state
 
 def run_until_terminated():
@@ -64,6 +74,10 @@ else:
 '''
 
 
+DIRECT_UPSTREAM_URL = "http://user:secret@203.0.113.7:3128"
+TUNNELLED_UPSTREAM_URL = "http://user:secret@127.0.0.1:15432"
+
+
 class TgproxyAgentTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory(prefix="tgproxy-agent-test-")
@@ -89,6 +103,7 @@ class TgproxyAgentTests(unittest.TestCase):
             return {
                 "listen_address": "127.0.0.1:1080",
                 "gost_upstream_url": "http://user:secret@203.0.113.7:3128",
+                "direct_upstream_url": "http://user:secret@203.0.113.7:3128",
                 "tunnel_ssh_host": "",
                 "tunnel_target_address": "203.0.113.7:3128",
                 "tunnel_local_port": "15432",
@@ -96,6 +111,7 @@ class TgproxyAgentTests(unittest.TestCase):
         return {
             "listen_address": "127.0.0.1:1080",
             "gost_upstream_url": "http://user:secret@127.0.0.1:15432",
+            "direct_upstream_url": "http://user:secret@203.0.113.7:3128",
             "tunnel_ssh_host": "jump",
             "tunnel_target_address": "203.0.113.7:3128",
             "tunnel_local_port": "15432",
@@ -189,37 +205,62 @@ class TgproxyAgentTests(unittest.TestCase):
         self.fail(f"{command} was not called {count} times")
 
     def retry_delays(self):
-        return [call[1] for call in self.calls_of("sleep") if call[1] != "1"]
+        delays, slept_s, ssh_calls = [], 0, 0
+        for call in self.read_state()["calls"]:
+            if call[0] == "sleep" and call[1] != "1":
+                slept_s += int(call[1])
+            elif call[0] == "ssh":
+                if ssh_calls:
+                    delays.append(slept_s)
+                slept_s = 0
+                ssh_calls += 1
+        return delays
 
-    def test_tunnel_exit_before_listening_is_retried_with_backoff(self):
+    def gost_upstreams(self):
+        return [call[-1] for call in self.calls_of("gost")]
+
+    def test_tunnel_failure_falls_back_to_direct_upstream_then_switches_back(self):
         self.write_state(ssh_failure_count=3)
         process = self.start_agent()
-        self.wait_for_calls("gost")
-        self.assertEqual(len(self.calls_of("ssh")), 4)
-        self.assertEqual(self.retry_delays(), ["5", "10", "20"])
+        self.wait_for_call_count("ssh", 4)
+        self.wait_for_call_count("gost", 2)
+        self.assertEqual(self.gost_upstreams(), [DIRECT_UPSTREAM_URL, TUNNELLED_UPSTREAM_URL])
+        self.assertEqual(self.retry_delays(), [5, 10, 20])
+        self.assertTrue(self.read_state().get("gost_terminated"))
         self.assertIsNone(process.poll())
         process.terminate()
         _, stderr = process.communicate(timeout=5)
         self.assertIn("ssh tunnel exited before listening", stderr)
+        self.assertIn("forwarding directly to the upstream proxy", stderr)
         self.assertRegex(stderr, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} tgproxy agent: retrying ssh tunnel in 5s")
+        self.assertIn("switching to the tunnelled upstream", stderr)
 
     def test_tunnel_retry_delay_is_capped(self):
         self.write_state(ssh_failure_count=8)
         process = self.start_agent()
-        self.wait_for_calls("gost")
-        self.assertEqual(self.retry_delays(), ["5", "10", "20", "40", "80", "160", "300", "300"])
+        self.wait_for_call_count("ssh", 9, timeout_s=60)
+        self.assertEqual(self.retry_delays(), [5, 10, 20, 40, 80, 160, 300, 300])
+        self.assertIsNone(process.poll())
 
-    def test_tunnel_readiness_timeout_stops_tunnel_and_retries(self):
+    def test_tunnel_readiness_timeout_falls_back_to_direct_upstream(self):
         self.write_state(tunnel_listening=False)
         process = self.start_agent()
         self.wait_for_call_count("ssh", 2)
+        self.wait_for_calls("gost")
         self.assertTrue(self.read_state().get("ssh_terminated"))
-        self.assertEqual(self.read_state()["sleeps"], 61)
-        self.assertEqual(self.retry_delays(), ["5"])
-        self.assertEqual(self.calls_of("gost"), [])
+        self.assertEqual(self.gost_upstreams(), [DIRECT_UPSTREAM_URL])
+        self.assertGreaterEqual(self.read_state()["sleeps"], 61)
         process.terminate()
         _, stderr = process.communicate(timeout=5)
         self.assertIn("did not start listening", stderr)
+
+    def test_direct_gost_exit_during_fallback_restarts_agent(self):
+        self.write_state(ssh_failure_count=100, gost_failure=True)
+        process = self.start_agent()
+        _, stderr = process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("forwarding directly to the upstream proxy", stderr)
+        self.assertIn("child process exited", stderr)
 
     def test_without_tunnel_runs_gost_directly(self):
         self.tunnel_disabled = True
