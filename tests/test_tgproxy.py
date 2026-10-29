@@ -41,8 +41,14 @@ if command == "launchctl":
             state["loaded"] = False
     else:
         raise AssertionError(arguments)
+elif command == "pgrep":
+    assert arguments == ["-P", str(state["pid"])]
+    for child_pid in state.get("child_pids", []):
+        print(child_pid)
+    exit_code = 0 if state.get("child_pids") else 1
 elif command == "lsof":
-    assert arguments == ["-nP", "-a", "-p", str(state["pid"]), "-iTCP@127.0.0.1:1080", "-sTCP:LISTEN", "-t"]
+    expected_pids = ",".join(str(pid) for pid in [state["pid"], *state.get("child_pids", [])])
+    assert arguments == ["-nP", "-a", "-p", expected_pids, "-iTCP@127.0.0.1:1080", "-sTCP:LISTEN", "-t"], arguments
     exit_code = 0 if state["listening"] else 1
 elif command == "sleep":
     state["sleeps"] = state.get("sleeps", 0) + 1
@@ -67,7 +73,7 @@ class TgproxyTests(unittest.TestCase):
         self.state_path = self.directory_path / "state.json"
         self.write_state(loaded=False, pid=1234, listening=True, calls=[])
         script = Path(__file__).parent.parent.joinpath("src/tgproxy.sh").read_text().replace("@listen_address@", "127.0.0.1:1080")
-        for command in ("launchctl", "lsof", "sleep"):
+        for command in ("launchctl", "lsof", "pgrep", "sleep"):
             executable_path = self.directory_path / command
             executable_path.write_text("#!" + sys.executable + "\n" + MOCK_EXECUTABLE)
             executable_path.chmod(0o755)
@@ -120,6 +126,12 @@ class TgproxyTests(unittest.TestCase):
         self.write_state(loaded=True)
         result = self.run_command("status")
         self.assertEqual(result.returncode, 0)
+        self.assertIn("running", result.stdout)
+
+    def test_listener_owned_by_child_process_counts(self):
+        self.write_state(loaded=True, child_pids=[1240, 1241])
+        result = self.run_command("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("running", result.stdout)
 
     def test_process_without_listener_is_not_reported_ready(self):

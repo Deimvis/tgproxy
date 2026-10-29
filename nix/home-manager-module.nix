@@ -30,6 +30,7 @@ let
       listen_address = cfg.listenAddress;
       launchctl = "/bin/launchctl";
       lsof = "/usr/sbin/lsof";
+      pgrep = "/usr/bin/pgrep";
       id = "${pkgs.coreutils}/bin/id";
       mkdir = "${pkgs.coreutils}/bin/mkdir";
       sleep = "${pkgs.coreutils}/bin/sleep";

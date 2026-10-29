@@ -16,11 +16,17 @@ service_process_id() {
         @sed@ -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p'
 }
 
+service_process_ids() {
+    local process_id=$1 child_process_ids
+    child_process_ids="$(@pgrep@ -P "$process_id" 2>/dev/null | tr '\n' ',')"
+    printf '%s' "$process_id,${child_process_ids}" | @sed@ 's/,*$//'
+}
+
 service_is_listening() {
     local process_id
     process_id="$(service_process_id)" || return 1
     [ -n "$process_id" ] || return 1
-    @lsof@ -nP -a -p "$process_id" -iTCP@"$listen_address" -sTCP:LISTEN -t >/dev/null 2>&1
+    @lsof@ -nP -a -p "$(service_process_ids "$process_id")" -iTCP@"$listen_address" -sTCP:LISTEN -t >/dev/null 2>&1
 }
 
 service_status() {
