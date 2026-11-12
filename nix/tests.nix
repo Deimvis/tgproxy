@@ -9,6 +9,7 @@ let
   pkgs = {
     coreutils = "/test/coreutils";
     gnused = "/test/gnused";
+    gnugrep = "/test/gnugrep";
     gost = "/test/gost";
     writeShellApplication = value: value // { outPath = "/test/${value.name}"; };
   };
@@ -59,6 +60,11 @@ assert (commandOf tunnelled).name == "tgproxy";
 assert !hasPlaceholder (commandOf tunnelled).text;
 assert hasInfix "listen_address='127.0.0.1:1080'" (commandOf tunnelled).text;
 assert hasInfix "/bin/launchctl bootstrap" (commandOf tunnelled).text;
+assert hasInfix "state_path='/Users/test/.local/state/tgproxy/agent.state'" (commandOf tunnelled).text;
+assert hasInfix "/usr/bin/plutil -extract" (commandOf tunnelled).text;
+assert hasInfix "state_path='/Users/test/.local/state/tgproxy/agent.state'" (agentScriptOf tunnelled).text;
+assert tunnelled.config.home.activation.tgproxyRefresh.after == [ "linkGeneration" ];
+assert hasInfix "run /test/tgproxy/bin/tgproxy refresh || " tunnelled.config.home.activation.tgproxyRefresh.data;
 assert hasInfix "listen_address='127.0.0.1:2080'" (commandOf direct).text;
 assert (agentScriptOf tunnelled).name == "tgproxy-agent";
 assert !hasPlaceholder (agentScriptOf tunnelled).text;

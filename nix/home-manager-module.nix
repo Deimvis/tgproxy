@@ -24,18 +24,23 @@ let
       (map (name: "@${name}@") (builtins.attrNames placeholders))
       (builtins.attrValues placeholders)
       text;
+  agentStatePath = "${config.home.homeDirectory}/.local/state/tgproxy/agent.state";
   command = pkgs.writeShellApplication {
     name = "tgproxy";
     text = substitutePlaceholders {
       listen_address = cfg.listenAddress;
+      state_path = agentStatePath;
       launchctl = "/bin/launchctl";
       lsof = "/usr/sbin/lsof";
       pgrep = "/usr/bin/pgrep";
+      plutil = "/usr/bin/plutil";
       id = "${pkgs.coreutils}/bin/id";
       mkdir = "${pkgs.coreutils}/bin/mkdir";
       sleep = "${pkgs.coreutils}/bin/sleep";
       tail = "${pkgs.coreutils}/bin/tail";
+      wc = "${pkgs.coreutils}/bin/wc";
       sed = "${pkgs.gnused}/bin/sed";
+      grep = "${pkgs.gnugrep}/bin/grep";
     } (builtins.readFile ../src/tgproxy.sh);
   };
   agent = pkgs.writeShellApplication {
@@ -47,7 +52,12 @@ let
       tunnel_ssh_host = if cfg.sshTunnel.enable then cfg.sshTunnel.host else "";
       tunnel_target_address = "${upstreamProxyHost}:${upstreamProxyPort}";
       tunnel_local_port = tunnelLocalPort;
+      state_path = agentStatePath;
       ssh = "/usr/bin/ssh";
+      mkdir = "${pkgs.coreutils}/bin/mkdir";
+      mv = "${pkgs.coreutils}/bin/mv";
+      rm = "${pkgs.coreutils}/bin/rm";
+      sed = "${pkgs.gnused}/bin/sed";
       lsof = "/usr/sbin/lsof";
       sleep = "${pkgs.coreutils}/bin/sleep";
       gost = "${pkgs.gost}/bin/gost";
@@ -86,6 +96,14 @@ in
 
   config = lib.mkIf cfg.enable {
     home.packages = [ command agent ];
+
+    home.activation.tgproxyRefresh = {
+      after = [ "linkGeneration" ];
+      before = [ ];
+      data = ''
+        run ${command}/bin/tgproxy refresh || echo "tgproxy: refresh failed; restart the agent with: tgproxy restart" >&2
+      '';
+    };
 
     home.file.".config/tgproxy/agent.plist".text = lib.generators.toPlist { escape = true; } {
       Label = "org.nix-community.home.tgproxy";

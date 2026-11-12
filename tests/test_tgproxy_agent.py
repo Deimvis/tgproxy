@@ -59,15 +59,21 @@ if command == "ssh":
     update_state(ssh_pid=os.getpid())
     run_until_terminated()
 elif command == "lsof":
+    if arguments[4] == "-iTCP@127.0.0.1:1080":
+        assert arguments == ["-nP", "-a", "-p", arguments[3], "-iTCP@127.0.0.1:1080", "-sTCP:LISTEN", "-t"], arguments
+        sys.exit(0 if state.get("gost_listening", True) and str(state.get("gost_pid")) == arguments[3] else 1)
     assert arguments == ["-nP", "-a", "-p", str(state.get("ssh_pid")), "-iTCP@127.0.0.1:15432", "-sTCP:LISTEN", "-t"], arguments
     sys.exit(0 if state["tunnel_listening"] else 1)
 elif command == "sleep":
     state = update_state(sleeps=state.get("sleeps", 0) + 1)
     if state.get("readiness_delay") == state["sleeps"]:
         update_state(tunnel_listening=True)
+    if float(arguments[0]) >= 5:
+        time.sleep(state.get("retry_sleep_duration_s", 0))
 elif command == "gost":
     if state.get("gost_failure"):
         sys.exit(1)
+    update_state(gost_pid=os.getpid())
     run_until_terminated()
 else:
     raise AssertionError(command)
@@ -86,8 +92,11 @@ class TgproxyAgentTests(unittest.TestCase):
         self.state_path = self.directory_path / "state.json"
         self.write_state(tunnel_listening=True, calls=[])
         script = Path(__file__).parent.parent.joinpath("src/agent.sh").read_text()
-        for placeholder, value in self.placeholders().items():
+        self.agent_state_path = self.directory_path / "agent state/agent.state"
+        for placeholder, value in dict(self.placeholders(), state_path=str(self.agent_state_path)).items():
             script = script.replace("@" + placeholder + "@", value)
+        for command in ("mkdir", "mv", "sed", "rm"):
+            script = script.replace("@" + command + "@", shlex.quote(shutil.which(command)))
         for command in ("ssh", "lsof", "sleep", "gost"):
             executable_path = self.directory_path / command
             executable_path.write_text("#!" + sys.executable + "\n" + MOCK_EXECUTABLE)
@@ -163,7 +172,7 @@ class TgproxyAgentTests(unittest.TestCase):
         self.write_state(tunnel_listening=False, readiness_delay=2)
         process = self.start_agent()
         self.wait_for_calls("gost")
-        self.assertEqual(self.read_state()["sleeps"], 2)
+        self.assertEqual(len([call for call in self.calls_of("sleep") if call[1] == "1"]), 2)
         self.assertEqual(
             self.calls_of("gost")[0][1:],
             ["-L", "socks5://127.0.0.1:1080", "-F", "http://user:secret@127.0.0.1:15432"],
@@ -207,7 +216,7 @@ class TgproxyAgentTests(unittest.TestCase):
     def retry_delays(self):
         delays, slept_s, ssh_calls = [], 0, 0
         for call in self.read_state()["calls"]:
-            if call[0] == "sleep" and call[1] != "1":
+            if call[0] == "sleep" and call[1] not in ("1", "0.2"):
                 slept_s += int(call[1])
             elif call[0] == "ssh":
                 if ssh_calls:
@@ -282,6 +291,84 @@ class TgproxyAgentTests(unittest.TestCase):
         _, stderr = process.communicate(timeout=8)
         self.assertEqual(process.returncode, 1)
         self.assertIn("child process exited", stderr)
+
+    def wait_for_log(self, process, text, timeout_s=10):
+        deadline = time.monotonic() + timeout_s
+        collected = ""
+        file_descriptor = process.stderr.fileno()
+        os.set_blocking(file_descriptor, False)
+        while time.monotonic() < deadline:
+            try:
+                chunk = os.read(file_descriptor, 65536)
+            except BlockingIOError:
+                chunk = b""
+            collected += chunk.decode(errors="replace")
+            if text in collected:
+                return collected
+            time.sleep(0.05)
+        self.fail(f"log does not contain {text!r}: {collected}")
+
+    def remaining_log(self, process, collected):
+        os.set_blocking(process.stderr.fileno(), True)
+        _, stderr = process.communicate(timeout=5)
+        return collected + stderr
+
+    def read_agent_state(self):
+        return dict(line.split("=", 1) for line in self.agent_state_path.read_text().splitlines())
+
+    def test_tunnelled_start_logs_each_step_and_records_state(self):
+        process = self.start_agent()
+        log = self.wait_for_log(process, "socks5 endpoint listening")
+        self.assertRegex(log, r"tgproxy agent: starting \(forwarding through an ssh tunnel via jump to 203\.0\.113\.7:3128\)\n.*tgproxy agent: starting ssh tunnel via jump\n.*tgproxy agent: ssh tunnel listening on 127\.0\.0\.1:15432\n.*tgproxy agent: socks5 endpoint listening on socks5://127\.0\.0\.1:1080 \(through the ssh tunnel via jump to 203\.0\.113\.7:3128\)")
+        self.assertNotIn("secret", log)
+        agent_state = self.read_agent_state()
+        self.assertEqual(agent_state["process_id"], str(process.pid))
+        self.assertEqual(agent_state["mode"], "tunnelled")
+        self.assertEqual(agent_state["ssh_host"], "jump")
+        self.assertEqual(agent_state["upstream_address"], "203.0.113.7:3128")
+        self.assertEqual(agent_state["next_tunnel_retry_ts"], "")
+        self.assertLessEqual(abs(int(agent_state["mode_start_ts"]) - time.time()), 5)
+
+    def test_fallback_records_direct_mode_and_next_tunnel_retry(self):
+        self.write_state(ssh_failure_count=100, retry_sleep_duration_s=0.5)
+        process = self.start_agent()
+        log = self.wait_for_log(process, "retrying ssh tunnel in 5s")
+        self.assertIn("socks5 endpoint listening on socks5://127.0.0.1:1080 (directly to 203.0.113.7:3128, not wrapped in ssh)", log)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.read_agent_state().get("next_tunnel_retry_ts", "") == "":
+            time.sleep(0.05)
+        agent_state = self.read_agent_state()
+        self.assertEqual(agent_state["mode"], "direct")
+        self.assertGreater(int(agent_state["next_tunnel_retry_ts"]), time.time())
+
+    def test_termination_during_tunnel_retry_wait_is_immediate_and_logged(self):
+        self.write_state(ssh_failure_count=100, retry_sleep_duration_s=30)
+        process = self.start_agent()
+        collected = self.wait_for_log(process, "retrying ssh tunnel in 5s")
+        termination_start = time.monotonic()
+        os.kill(process.pid, signal.SIGTERM)
+        stderr = self.remaining_log(process, collected)
+        self.assertLess(time.monotonic() - termination_start, 3)
+        self.assertEqual(process.returncode, 0)
+        self.assertIn("tgproxy agent: stop requested (SIGTERM); stopping gost and the ssh tunnel", stderr)
+        self.assertIn("tgproxy agent: stopped", stderr)
+        self.assertTrue(self.read_state().get("gost_terminated"))
+        self.assertFalse(self.agent_state_path.exists())
+
+    def test_endpoint_that_does_not_listen_is_reported(self):
+        self.write_state(gost_listening=False)
+        process = self.start_agent()
+        self.wait_for_log(process, "socks5 endpoint is not listening yet on socks5://127.0.0.1:1080")
+        self.assertIsNone(process.poll())
+
+    def test_direct_start_logs_upstream(self):
+        self.tunnel_disabled = True
+        self.setUp()
+        process = self.start_agent()
+        log = self.wait_for_log(process, "socks5 endpoint listening")
+        self.assertIn("tgproxy agent: starting (forwarding directly to 203.0.113.7:3128)", log)
+        self.assertIn("socks5 endpoint listening on socks5://127.0.0.1:1080 (directly to 203.0.113.7:3128)", log)
+        self.assertEqual(self.read_agent_state()["mode"], "direct")
 
     def test_shellcheck(self):
         result = subprocess.run(

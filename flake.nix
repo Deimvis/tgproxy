@@ -15,7 +15,7 @@
 
       checks = forAllSystems (pkgs: {
         unit = pkgs.runCommand "tgproxy-unit-tests" {
-          nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.shellcheck pkgs.coreutils pkgs.gnused ];
+          nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.shellcheck pkgs.coreutils pkgs.gnused pkgs.gnugrep ];
         } ''
           export HOME="$TMPDIR"
           cp -r ${./.} source
